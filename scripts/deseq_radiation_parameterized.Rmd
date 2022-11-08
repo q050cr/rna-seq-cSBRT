@@ -1,0 +1,731 @@
+---
+title: "`r params$doc_title`"
+author: | 
+        | christoph.reich@med.uni-heidelberg.de 
+        | jan.haas@med.uni-heidelberg.de
+        | benjamin.meder@med.uni-heidelberg.de
+        | Klinik für Kardiologie, Angiologie und Pneumologie
+        | Universitätsklinikum Heidelberg
+        | 
+date: "`r format(Sys.time(), '%d %B, %Y, %H:%M')`"
+params:
+  date: !r Sys.Date()
+  doc_title: "The Default Title"
+  strat_groups: "radiation2groups"
+  continous: FALSE
+  LV_only: TRUE
+  pval_threshold: 0.05  # default in DESeq2
+output: 
+  html_document:
+    theme: paper
+    toc: true
+    number_sections: true
+    toc_float: true
+    toc_depth: 4
+    df_print: kable
+    latex_engine: xelatex
+#bibliography: ../references/project01.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE)
+library(DESeq2)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(janitor)
+library(kableExtra)
+
+# reference directory is file directory on cluster!
+```
+
+
+![AG Meder](../../img/meder_presentation_heart.png)
+
+# Version Update
+
+The new report version includes: 
+
+* First Analysis
+* Parameters were set to: 
+    + Analysis groups: `r params$strat_groups`
+    + Samples from left ventricle only: `r params$LV_only`
+    + Adjusted p-value: `r params$pval_threshold`
+    + Continous analysis: `r params$continous`
+
+Discussion: 
+
+- LV3 segment not in sample annotation, but 7 RV segments!, one sample in count matrix called "Undetermined"; matching sample? LV3 or RV7??
+
+# Sample information
+
+```{r load-and-tidy-dat}
+# load data
+cbsrt_seq <- readRDS(file = "../rawcounts/rawCounts.rds") # count data
+orig_dat <- as_tibble(
+  clean_names(openxlsx::read.xlsx("../metadata/Segmentierung Bestrahlungsdosen.xlsx"))
+)
+cbsrt_rawcounts <- cbsrt_seq$counts
+# Geneid: rownames(cbsrt_rawcounts)
+
+id_matching <- read.table("../metadata/ID_matching.txt", header = TRUE)
+
+# tidy data
+dat <- orig_dat %>% 
+  # delete last row (which is sum only)
+  dplyr::slice(1:23) %>% 
+  dplyr::mutate(dose_vol_averaged = dose_gy_average / roi_vol_cm_3,
+         radiation2groups = factor(ifelse(dose_vol_averaged < median(dose_vol_averaged), "low_level", "high_level")),
+         radiation3groups = factor(dplyr::ntile(dose_vol_averaged, n=3), labels = c("low_level","mid_level", "high_level")),
+         radiation4groups = factor(dplyr::ntile(dose_vol_averaged, n=4), labels = c("low_level","lowmid_level","highmid_level", "high_level"))) %>% 
+  dplyr::left_join(id_matching, by = c("segment"="origID"))
+
+# stratify average dose by median
+median_dose <- median(dat$dose_vol_averaged)
+
+
+# no sample from following segments
+missing_segment <- dat[is.na(dat$SID),][["segment"]]
+
+# create DESeq2 object
+## needs raw counts, metadata, design formulas
+```
+
+We have samples from every heart segment (except for segment: `r missing_segment`) of a single patient. Also, we have one "Undetermined" SID that may match to `r missing_segment` and is dealt with like this in the following analysis. For differential gene expression analysis we stratify the samples into groups based on their radiation levels: `r params$strat_groups`.
+
+```{r LV3-update}
+# unnamed in count matrix column "Undetermined" may be from segment LV3? What about SID 16739? is annotated in sample sheet as RV7. not present in radiation data 
+# dat[dat$segment=="LV3", ]$SID <- 16739  # CAVE but this sample is annotated as RV7 in sample sheet
+## sample "Undetermined" in count matrix replaced below
+
+dat <- dat %>% dplyr::filter(segment != "LV3")
+```
+
+
+```{r LV-only}
+# analyze samples from LV only?
+if (params$LV_only == TRUE) {
+  dat <- dat %>% 
+    dplyr::filter(stringr::str_starts(segment, pattern = "LV"))
+}
+```
+
+```{r analysis-sample-overview}
+dat %>% 
+   kableExtra::kable(digits=3, caption = "Phenodata") %>% 
+   kable_styling(font_size = 10) 
+```
+
+
+# Differential gene expression
+
+## Create DESeq object
+
+Provide:
+
+- raw counts
+- associated metadata
+
+```{r DESeq-object}
+# http://master.bioconductor.org/packages/release/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html#preparing-quantification-input-to-deseq2
+## 2.4 DESeq2 import functions
+## from `Rsubread` 
+
+# harmonize count data with metadata
+# 1) replace everything after "." in string, e.g. "SID16755.R1.fastq.gz.bam" -> "SID16755"
+colnames(cbsrt_rawcounts) <- gsub(pattern = "\\..*", replacement = "", colnames(cbsrt_rawcounts)) 
+# 2) add "SID" to metadata SID column
+dat$SID <- paste("SID", dat$SID, sep = "")
+# could also only extract digits from count ID  "SID16733" -> "16733"
+# stringr::str_extract(pattern = "(\\d)+",  test)
+
+# deal with "Undetermined" Sample and Sample "SID16739"; step could be left out! just to declare that samples not present
+cbsrt_rawcounts <- cbsrt_rawcounts[, colnames(cbsrt_rawcounts) != "Undetermined" & colnames(cbsrt_rawcounts) != "SID16739"]
+# only keep samples that are in "dat$SID"
+cbsrt_rawcounts <- cbsrt_rawcounts[, colnames(cbsrt_rawcounts) %in% dat$SID]
+
+### REORDER ---------------
+# Use the match() function to reorder the columns of the raw counts
+reorder_idx <- match(dat$SID, colnames(cbsrt_rawcounts))
+# check
+#all(dat$SID == colnames(cbsrt_rawcounts))
+# Reorder the columns of the count data
+reordered_cbsrt_rawcounts <- cbsrt_rawcounts[ , reorder_idx]
+#all(dat$SID == colnames(reordered_cbsrt_rawcounts))
+
+dat <- dat %>% 
+  column_to_rownames(var = "SID")
+```
+
+
+```{r DESeq-object2}
+
+if (params$continous == TRUE) {
+  analysis_variable <- "dose_vol_averaged"
+} else {
+  analysis_variable <- params$strat_groups
+}
+
+# Create a DESeq2 object
+design <- as.formula(paste0("~", analysis_variable))
+
+dds_cbsrt <- DESeqDataSetFromMatrix(
+  countData =  reordered_cbsrt_rawcounts,
+  colData =  dat,
+  design = design   # here is no further adjustment needed 
+      # "~ strain + sex + treatment"  if condition of interest is treatment, then it would come last in the formula with the other factors preceding it in any order
+      # continous analysis: M. Love https://support.bioconductor.org/p/126713/ 
+  )
+```
+
+
+### Count Normalization
+
+There are factors other than RNA expression that can influence the number of reads aligning to each gene. We can adjust the count data to remove the influence of these factors on the overall counts using normalization methods. The main factors often considered during normalization of count data are library depth, gene length, and RNA composition. DESeq2 uses a 'median of ratios' method of normalization. This method adjusts the raw counts for library size and is resistant to large numbers of differentially expressed genes.
+
+```{r count-normalization}
+# Determine the size factors to use for normalization
+dds_cbsrt <- estimateSizeFactors(dds_cbsrt)
+# Extract the normalized counts
+cbsrt_normalized_counts <- counts(dds_cbsrt, normalized=TRUE)
+```
+
+
+### Unsupervised Clustering Analysis
+
+Hierarchical clustering with heatmaps is used to assess the similarity in gene expression between the different samples in a dataset. This technique is used to explore how similar replicates are to each other and whether the samples belonging to different sample groups cluster separately. The heatmap is created by using the gene expression correlation values for all pairwise combinations of samples in the dataset, with the value 1 being perfect correlation. The hierarchical tree shows which samples are more similar to each other and the colors in the heatmap depict the correlation values. We expect the biological replicates to cluster together and sample conditions to cluster apart. Since the majority of genes should not be differentially expressed, samples should generally have high correlations with each other. Samples with correlation values below 0.8 may require further investigation to determine whether these samples are outliers or have contamination.
+
+```{r clustering}
+# 1) variance stabilizing transformation - log transform the normalized counts to improve the visualization of the clustering. 
+# For RNA-Seq data, DESeq2 uses a variance stabilizing transformation (VST), which is a logarithmic 
+#       transformation that moderates the variance across the mean. 
+
+# Transform the normalized counts variance stabilizing transformation
+vsd_cbsrt <- vst(dds_cbsrt, 
+                 blind=TRUE  # whether to blind the transformation to the experimental design
+                 )
+
+vsd_cbsrt %>% 
+  assay() %>%   # extract the vst matrix of transformed counts from the object
+  cor() %>%   # Compute the pairwise correlation values between samples
+  pheatmap::pheatmap(annotation_col =  dplyr::select(.data = dat, 
+                                                     # We need to convert the character condition into a raw expression.
+                                                     eval(parse(text = "params$strat_groups"))))   # heatmap with annotation bar designating condition
+```
+
+### PCA
+
+```{r pca}
+plotPCA(vsd_cbsrt, intgroup=params$strat_groups) +
+  ggthemes::theme_few()+
+  ggthemes::scale_color_few()
+```
+
+
+## DESeq model
+
+The differential expression analysis with DESeq2 consists of roughly three steps: fitting the raw counts for each gene to the DESeq2 negative binomial model and testing for differential expression, shrinking the log2 fold changes, and extracting and visualizing the results.
+
+```{r DESeq}
+# This function performs a default analysis through the steps:
+# 1. estimation of size factors: estimateSizeFactors
+# 2. estimation of dispersion: estimateDispersions
+# 3. Negative Binomial GLM fitting and Wald statistics: nbinomWaldTest
+dds_cbsrt <- DESeq(dds_cbsrt)
+
+# resultsNames(dds_cbsrt)
+```
+
+### Exploring dispersions
+
+Let's explore the fit of our smoc2 data to the negative binomial model by plotting the dispersion estimates using the plotDispEsts() function. Remember that the dispersion estimates are used to model the raw counts; if the dispersions don't follow the assumptions made by DESeq2, then the variation in the data could be poorly estimated and the DE results could be less accurate.
+The assumptions DESeq2 makes are that the dispersions should generally decrease with increasing mean and that they should more or less follow the fitted line.
+
+```{r dispersion estimates}
+plotDispEsts(dds_cbsrt)
+```
+
+ We observe a good fit, since the dispersions decreases with increasing mean and cluster around the maximum likelihood (ML) line.
+
+
+### Extracting results
+
+```{r go-get-results}
+# resultsNames(dds_cbsrt)
+# Extract the results of the differential expression analysis
+if (params$continous == FALSE) {
+  cbsrt_res <- results(dds_cbsrt, 
+                  contrast = c(params$strat_groups, 'high_level', 'low_level'),  
+                  alpha = params$pval_threshold,  # default 0.1, with 0.05 no significant genes!
+                  lfcThreshold = 0  # default = 0, try also setting to e.g. 0.32..
+                  )
+} else{
+  cbsrt_res <- results(dds_cbsrt, 
+                  #contrast = c(params$strat_groups, 'high_level', 'low_level'),  
+                  alpha = params$pval_threshold,  # default 0.1, with 0.05 no significant genes!
+                  lfcThreshold = 0  # default = 0, try also setting to e.g. 0.32..
+                  )  
+}
+
+
+
+# 3 groups design matrix -----------------------------------------------------------------------
+# # (with bioc limma)
+# library(limma)
+# 
+# # Create a contrasts matrix
+# design <- model.matrix(~0+radiation3groups, data=dat)  # 0 necessary! matrix with no intercept
+# #colSums(design)
+# cm <- limma::makeContrasts(midVSlow = radiation3groupsmid_level - radiation3groupslow_level,
+#                           highVSlow = radiation3groupshigh_level -radiation3groupslow_level,
+#                           highVSmid = radiation3groupshigh_level - radiation3groupsmid_level,
+#                           levels = design)
+# # View the contrasts matrix
+# cm
+# Test for differential expression for 3 groups ... did pairwise analysis with DESeq2
+```
+
+We used an adjusted p-value threshold of $p_{adj}=$`r params$pval_threshold` in this analysis. 
+
+### LFC shrinkage
+
+To improve the fold change estimates for our data, we want to take our results and shrink the log2 fold changes using the lfcShrink() function.
+
+```{r lfc-shrinkage}
+# only if variable is not continous?
+if (params$continous == FALSE) {
+  # Shrink the log2 fold change estimates to be more accurate
+  ## function adds shrunken log2 fold changes (LFC) and SE to a results table from DESeq run without LFC shrinkage
+  cbsrt_res <- lfcShrink(dds_cbsrt,
+                      contrast =  c(params$strat_groups, 'high_level', 'low_level'),  
+                      res = cbsrt_res,
+                      type = "normal",  #default "normal" 
+                          # Note that type='apeglm' and type='ashr' have shown to have less bias than type='normal'
+                     )   #res ... results object!
+}
+
+```
+
+We now have constructed our final results table with more accurate log 2 fold changes.
+
+
+### Add annotation
+
+```{r add-annotation}
+# https://bioinformatics-core-shared-training.github.io/RNAseq-R/rna-seq-annotation-visualisation.nb.html
+
+## packages loaded by Jan's script "featureCounts_DeSeq_analysis.R"
+library(rtracklayer)  # R interface to genome annotation files and the UCSC genome browser
+library(AnnotationHub)  # Client to access AnnotationHub resources
+library(Rsamtools)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)  # annotation package for TxDb objects
+library(org.Hs.eg.db)  # Genome wide annotation for human
+library(biomaRt)  # interface to BioMart databases (i.e. Ensembl)
+listMarts()  # returns list of biomaRt databases to which biomaRt can connect to
+library(EnsDb.Hsapiens.v86)  # Ensembl based annotation package
+
+#columns(org.Hs.eg.db)
+#  [1] "ACCNUM"       "ALIAS"        "ENSEMBL"      "ENSEMBLPROT"  "ENSEMBLTRANS" "ENTREZID"     "ENZYME"       "EVIDENCE"     "EVIDENCEALL" 
+# [10] "GENENAME"     "GO"           "GOALL"        "IPI"          "MAP"          "OMIM"         "ONTOLOGY"     "ONTOLOGYALL"  "PATH"        
+# [19] "PFAM"         "PMID"         "PROSITE"      "REFSEQ"       "SYMBOL"       "UCSCKG"       "UNIGENE"      "UNIPROT" 
+
+# keytypes(org.Hs.eg.db)
+#  [1] "ACCNUM"       "ALIAS"        "ENSEMBL"      "ENSEMBLPROT"  "ENSEMBLTRANS" "ENTREZID"     "ENZYME"       "EVIDENCE"     "EVIDENCEALL"  "GENENAME"     "GO"          
+# [12] "GOALL"        "IPI"          "MAP"          "OMIM"         "ONTOLOGY"     "ONTOLOGYALL"  "PATH"         "PFAM"         "PMID"         "PROSITE"      "REFSEQ"      
+# [23] "SYMBOL"       "UCSCKG"       "UNIGENE"      "UNIPROT" 
+
+keys(org.Hs.eg.db, keytype="ENTREZID")[1000:1005]
+
+#It is a useful sanity check to make sure that the keys you want to use are all valid. We could use %in% in this case.
+## Build up the query step-by-step
+my.keys <- rownames(cbsrt_rawcounts)[1:50]
+#my.keys %in% keys(org.Hs.eg.db, keytype="ENTREZID")
+#all(my.keys %in% keys(org.Hs.eg.db, keytype="ENTREZID"))  # not all present?
+
+# To annotate our results, we definitely want gene symbols and perhaps the full gene name. 
+ann <- select(org.Hs.eg.db,keys=rownames(cbsrt_res),columns=c("ENTREZID","SYMBOL","GENENAME"))
+## -> "'select()' returned 1:1 mapping between keys and columns"
+#head(ann)
+# Let’s double check that the ENTREZID column matches exactly to our results rownames.
+table(ann$ENTREZID==rownames(cbsrt_res))
+
+# We can bind in the annotation information to the results data frame. 
+## (Please note that if the select function returns a 1:many mapping then you can’t just append the annotation to the fit object.)
+
+cbsrt_res_annotated <- cbind(cbsrt_res, ann)
+# save results table
+file_name.csv <- paste0("../results/", format(Sys.time(), "%Y%m%d"), "cbsrt_res_annotated_pval", params$pval_threshold, "_",
+                        params$strat_groups, "_cont_analysis_", params$continous, "_LV_only_", params$LV_only,
+                        "_high_low.csv")
+file_name.rds <- paste0("../results/", format(Sys.time(), "%Y%m%d"), "cbsrt_res_annotated_pval", params$pval_threshold, "_",
+                        params$strat_groups, "_cont_analysis_", params$continous, "_LV_only_", params$LV_only,
+                        "_high_low.rds")
+
+write.csv2(cbsrt_res_annotated,file=file_name.csv,row.names=FALSE)
+saveRDS(cbsrt_res_annotated,file=file_name.rds)
+
+#####
+#edb <- EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86
+## info
+#edb
+#organism(edb)  # Homo sapiens
+#supportedFilters(edb)    # interesting
+#                       filter                 field
+# 1               EntrezFilter                entrez
+# 2              ExonEndFilter              exon_end
+# 3               ExonIdFilter               exon_id
+# 4             ExonRankFilter             exon_rank
+# 5            ExonStartFilter            exon_start
+# 6          GeneBiotypeFilter          gene_biotype
+# 7              GeneEndFilter              gene_end
+# 8               GeneIdFilter               gene_id
+## etc.
+
+# genes(edb)  # GRanges object with 63970 ranges and 6 metadata columns:
+#as.data.frame(genes(edb))->genes.DF 
+#write.table(genes.DF,"../metadata/ENSMBL.genes.v86.bed",row.names = F,col.names = F,quote = F,sep = "\t")
+```
+
+
+## Summarizing DESeq2 results
+
+```{r summary}
+summary(cbsrt_res)
+```
+
+In the output above the numbers/percentages of up- and down-regulated genes are shown, as well as, information about independent filtering and outliers removed.
+
+```{r save-results-df}
+cbsrt_res_all <- data.frame(cbsrt_res)
+
+# Subset the results to only return the significant genes with p-adjusted values less than 0.05
+cbsrt_res_sig_subset <- subset(cbsrt_res_annotated, padj < params$pval_threshold)
+```
+
+
+### MA Plot
+
+```{r}
+# MA plot is an application of a Bland–Altman plot for visual representation of genomic data. 
+##The plot visualizes the differences between measurements taken in two samples, by transforming 
+##the data onto M (log ratio) and A (mean average) scales, then plotting these values.
+
+BiocGenerics::plotMA(cbsrt_res, ylim=c(-2,2))
+```
+
+
+```{r  ggplot-equivalent-smear-plot}
+# edgeR::plotSmear(): Make a mean-difference plot (MA-plot) of two libraries of count data with smearing of points with very low counts
+## LogCPM vs LogFC: LogCPM are the log counts per million, which can be understood as measuring expression level.
+
+# Generate a new logical column (vector) regarding whether padj values are less than 0.05 for the results 
+cbsrt_res_all <- data.frame(cbsrt_res) %>% 
+  dplyr::mutate(threshold = padj < params$pval_threshold) %>% 
+  dplyr::mutate(threshold = ifelse(is.na(threshold), FALSE, threshold ))
+
+# https://bioinformatics-core-shared-training.github.io/RNAseq-R/rna-seq-annotation-visualisation.nb.html
+cbsrt_res_annotated_tibble <- as_tibble(cbsrt_res_annotated) %>% 
+  dplyr::mutate(threshold = padj < params$pval_threshold) %>% 
+  dplyr::mutate(threshold = ifelse(is.na(threshold), FALSE, threshold ))
+
+caption_upreg <- paste0("Top upregulated genes with padj \u2264 ", params$pval_threshold)
+caption_downreg <- paste0("Top downregulated genes with padj \u2264 ", params$pval_threshold)
+
+# cbsrt_res_annotated_tibble %>% 
+#   dplyr::filter(padj < params$pval_threshold & log2FoldChange > 1.0) %>% 
+#   kableExtra::kable(digits=3, caption = caption_upreg) %>% 
+#   kable_styling(font_size = 10)
+# 
+# cbsrt_res_annotated_tibble %>% 
+#   dplyr::filter(padj < params$pval_threshold & log2FoldChange < -1.0) %>% 
+#   kableExtra::kable(digits=3, caption = caption_downreg) %>% 
+#   kable_styling(font_size = 10)
+
+cbsrt_res_annotated_tibble %>% 
+  dplyr::filter(padj <= params$pval_threshold &
+                  log2FoldChange > 0) %>%   # only upregulated
+  dplyr::arrange(desc(log2FoldChange)) %>% 
+  dplyr::slice(1:20) %>% 
+  kableExtra::kable(digits=3, caption = caption_upreg) %>% 
+  kable_styling(font_size = 10)
+
+
+cbsrt_res_annotated_tibble %>% 
+  dplyr::filter(padj <= params$pval_threshold &
+                  log2FoldChange < 0) %>%   # only upregulated
+  dplyr::arrange((log2FoldChange)) %>% 
+  dplyr::slice(1:20) %>% 
+  kableExtra::kable(digits=3, caption = caption_downreg) %>% 
+  kable_styling(font_size = 10)
+
+## MA ggplot
+ggplot(cbsrt_res_annotated_tibble, aes(x = log(baseMean), y=log2FoldChange, col=threshold)) +   # col=padj < 0.1
+  geom_point(alpha=0.4) +
+  geom_hline(yintercept=0, color = "red", size=2, alpha=0.6) +
+  scale_colour_manual(values=c("black", "red"))+
+  ggthemes::theme_few()
+```
+
+
+### P-value distribution
+
+It is also important to observe the distribution of raw p-values. We expect to see a peak around low p-values and a uniform distribution at P-values above 0.1. Otherwise, adjustment for multiple testing does not work and the results are not meaningful.
+
+```{r}
+ggplot(data = cbsrt_res_annotated_tibble, aes(x = pvalue)) + 
+  geom_histogram(bins = 100)+
+  labs(caption = "P-value distribution genes before adjusting for multiple testing.")+
+  ggthemes::theme_few()+
+  ggthemes::scale_color_few()
+
+# https://compgenomr.github.io/book/gene-expression-analysis-using-high-throughput-sequencing-technologies.html#differential-expression-analysis  8.3.7.1.2 P-value distribution
+```
+
+
+### Volcano plot
+
+The next figure is a Volcano plot  of the log2-fold-change values versus the -log10 adjusted p-value and coloring the points for the genes by whether or not they are significant.
+
+```{r volcano-gg, fig.show="hold", out.width="50%"}
+## https://biocorecrg.github.io/CRG_RIntroduction/volcano-plots.html
+# add a column of NAs
+cbsrt_res_annotated_tibble$diffexpressed <- "NO"
+# if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+cbsrt_res_annotated_tibble$diffexpressed[cbsrt_res_annotated_tibble$log2FoldChange > 1.0 & 
+                                           cbsrt_res_annotated_tibble$padj < params$pval_threshold] <- "UP"
+# if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+cbsrt_res_annotated_tibble$diffexpressed[cbsrt_res_annotated_tibble$log2FoldChange < -1.0 & 
+                                           cbsrt_res_annotated_tibble$padj < params$pval_threshold] <- "DOWN"
+
+log2folds_thresholds <- c(0.8, 0.7, 0.6, 0.5, 0.4)
+for (i in log2folds_thresholds) {
+  if ( sum(cbsrt_res_annotated_tibble$diffexpressed != "NO"  ) < 30 ) {
+  cbsrt_res_annotated_tibble$diffexpressed[cbsrt_res_annotated_tibble$log2FoldChange > i & 
+                                             cbsrt_res_annotated_tibble$padj < params$pval_threshold] <- "UP"
+  # if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+  cbsrt_res_annotated_tibble$diffexpressed[cbsrt_res_annotated_tibble$log2FoldChange < - i & 
+                                           cbsrt_res_annotated_tibble$padj < params$pval_threshold] <- "DOWN"
+  log2folds_thresh <- i
+  } else{ 
+    log2folds_thresh <- 1
+    break
+    }
+}
+
+
+ggplot(cbsrt_res_annotated_tibble) + 
+        geom_point(aes(x = log2FoldChange, y = -log10(padj), color = threshold)) + 
+        geom_vline(xintercept=c(-log2folds_thresh, log2folds_thresh), alpha=0.3) +
+        geom_hline(yintercept=-log10(params$pval_threshold), alpha=0.3) + 
+        xlab("log2 fold change") + 
+        ylab("-log10 adjusted p-value") + 
+        theme(legend.position = "none", 
+              plot.title = element_text(size = rel(1.5), hjust = 0.5), 
+              axis.title = element_text(size = rel(1.25)))+
+        ggthemes::theme_few() +
+        ggthemes::scale_color_few() -> p
+p
+# Re-plot but this time color the points with "diffexpressed"
+ggplot(cbsrt_res_annotated_tibble) + 
+        geom_point(aes(x = log2FoldChange, y = -log10(padj), color = diffexpressed)) + 
+        geom_vline(xintercept=c(-log2folds_thresh, log2folds_thresh), alpha=0.3) +
+        geom_hline(yintercept=-log10(params$pval_threshold), alpha=0.3) + 
+        xlab("log2 fold change") + 
+        ylab("-log10 adjusted p-value") + 
+        theme(legend.position = "none", 
+              plot.title = element_text(size = rel(1.5), hjust = 0.5), 
+              axis.title = element_text(size = rel(1.25)))+
+        ggthemes::theme_few() +
+        ggthemes::scale_color_few() -> p1
+p1
+
+# mycolors <- c("blue", "red", "black")
+# names(mycolors) <- c("DOWN", "UP", "NO")
+# p3 <- p2 + scale_colour_manual(values = mycolors)
+```
+
+
+```{r volcano-gg-labeled}
+## label genes ######----------------------------------------
+cbsrt_res_annotated_tibble$delabel <- NA
+cbsrt_res_annotated_tibble$delabel[cbsrt_res_annotated_tibble$diffexpressed != "NO"] <- 
+  cbsrt_res_annotated_tibble$SYMBOL[cbsrt_res_annotated_tibble$diffexpressed != "NO"]
+
+subtitle.custom <- paste0("log2foldchange = \u00b1 ", log2folds_thresh, " for significant genes (p_adj < ", params$pval_threshold, ")")
+
+ggplot(data=cbsrt_res_annotated_tibble, aes(x=log2FoldChange, y=-log10(padj), col=diffexpressed, label=delabel)) + 
+        geom_point() + 
+        geom_vline(xintercept=c(-log2folds_thresh, log2folds_thresh), alpha=0.3) +
+        geom_hline(yintercept=-log10(params$pval_threshold), alpha=0.3) + 
+        labs(title = "Volcano plot",
+              subtitle = subtitle.custom,
+              caption = paste0(params$strat_groups, ": high-vs-low radiation | continous analysis: ", params$continous)) +
+        xlab("log2 fold change") + 
+        ylab("-log10 adjusted p-value") + 
+        theme(legend.position = "none", 
+              plot.title = element_text(size = rel(1.5), hjust = 0.5), 
+              axis.title = element_text(size = rel(1.25)))+
+        ggthemes::theme_few() +
+        ggthemes::scale_color_few()+
+        ggrepel::geom_text_repel()     # adds jitter
+  #geom_text(size=3)-> p2
+```
+
+
+### Heatmap
+
+Visualizations can also be helpful in exploring the significant genes in more detail. The expression heatmap can be helpful in looking at how different the expression of all significant genes are between sample groups, while the expression plot can look at the top significant genes or choose individual genes of interest to investigate the expression levels between samplegroups.
+
+```{r heatmap-deseq}
+
+if (dim(cbsrt_res_sig_subset)[1] > 3) {
+  # Subset normalized counts to to only include the significant genes. Use the row names of the smoc2_res_sig significant results to subset the normalized counts, normalized_counts_smoc2.
+sig_norm_counts_cbsrt <- cbsrt_normalized_counts[rownames(cbsrt_res_sig_subset), ]
+
+# Choose heatmap color palette
+heat_colors <- RColorBrewer::brewer.pal(n = 6, name = "YlOrRd")
+
+# Plot heatmap: Color the heatmap using the palette, heat_colors, cluster the rows without showing row names, and scale the values by "row". For the annotation, use select() to select only the condition column from the smoc2_metadata.
+pheatmap::pheatmap(sig_norm_counts_cbsrt, 
+         color = heat_colors, 
+         cluster_rows = T, 
+         show_rownames = F,
+         annotation = dplyr::select(dat, 
+                                     eval(parse(text = "params$strat_groups"))), 
+         scale = "row")
+} else {
+  print("No meaningful heatmap possible since we did not observe significant DE-genes.")
+}
+
+```
+
+
+---
+### Chromosomal regions
+
+---
+
+# Functional enrichment analysis
+
+## GO term analysis
+
+GO term analysis is probably the most common analysis applied after a DE analysis. GO term analysis helps quickly find out systematic changes that can describe differences between groups of samples. Available data sources and their abbreviations are: 
+
+* Gene Ontology (GO or by branch GO:MF, GO:BP, GO:CC)
+* KEGG (KEGG)
+* Reactome (REAC)
+* WikiPathways (WP)
+* TRANSFAC (TF)
+* miRTarBase (MIRNA)
+* Human Protein Atlas (HPA)
+* CORUM (CORUM)
+* Human phenotype ontology (HP)
+
+```{r}
+#select genes with absolute log2 fold change above set threshold `log2folds_thresh`
+DE <- cbsrt_res_annotated_tibble %>% 
+  dplyr::filter(diffexpressed != "NO")
+genesOfInterest <- DE$SYMBOL
+
+if (nrow(DE) >= 1) {
+  # library(gProfileR)  # old package
+  # https://compgenomr.github.io/book/gene-expression-analysis-using-high-throughput-sequencing-technologies.html#differential  -expression-analysis chapter 8.3.8
+  # goResults <- gprofiler(query = genesOfInterest, 
+  #                      organism = 'hsapiens', 
+  #                      src_filter = 'GO', 
+  #                      hier_filtering = 'moderate')
+  
+  #calculate enriched GO terms 
+  ## https://cran.r-project.org/web/packages/gprofiler2/vignettes/gprofiler2.html#gene-list-functional-enrichment-analysis-wit  h-gost
+  library(gprofiler2)
+  goResults <- gprofiler2::gost(query = genesOfInterest, 
+                                organism = "hsapiens", 
+                                ordered_query = FALSE,   # biological importance?
+                                multi_query = FALSE, 
+                                significant = TRUE, 
+                                exclude_iea = FALSE, 
+                                measure_underrepresentation = FALSE, 
+                                evcodes = TRUE, # can decrease performance, adds col "intersection"
+                                user_threshold = 0.05, 
+                                correction_method = "g_SCS", 
+                                domain_scope = "annotated", 
+                                custom_bg = NULL, 
+                                numeric_ns = "", 
+                                sources = NULL, ## could filter only "GO" or "KEGG", "REAC", "TF", "MIRNA", "CO-RUM", etc
+                                as_short_link = FALSE  # results as short-link to the g:Profiler web tool, not a dataframe
+                                )
+  
+  goResults$result %>% 
+      kableExtra::kable(digits=3, caption = "query-goResults") %>% 
+     kable_styling(font_size = 10) 
+  #names(goResults$meta)
+}
+
+```
+
+* query - the name of the input query which by default is the order of query with the prefix “query_.” This can be changed by using a named list input.
+* significant - indicator for statistically significant results
+* p_value - hypergeometric p-value after correction for multiple testing
+* term_size - number of genes that are annotated to the term
+* query_size - number of genes that were included in the query. This might be different from the size of the original list if:
+    + any genes were mapped to multiple Ensembl gene IDs
+    + any genes failed to be mapped to Ensembl gene IDs
+    + the parameter ordered_query = TRUE and the optimal cutoff for the term was found before the end of the query
+    + the domain_scope was set to “annotated” or “custom”
+
+- intersection_size - the number of genes in the input query that are annotated to the corresponding term
+- precision - the proportion of genes in the input list that are annotated to the function (defined as intersection_size/query_size)
+- recall - the proportion of functionally annotated genes that the query recovers (defined as intersection_size/term_size)
+- term_id - unique term identifier (e.g GO:0005005)
+- source - the abbreviation of the data source for the term (e.g. GO:BP)
+- term_name - the short name of the function
+- effective_domain_size - the total number of genes “in the universe” used for the hypergeometric test
+- source_order - numeric order for the term within its data source (this is important for drawing the results)
+- parents - list of term IDs that are hierarchically directly above the term. For non-hierarchical data sources this points to an artificial root node.
+
+### Gostplot - Manhattan-like-plot
+
+```{r gostplot}
+if (nrow(DE) >= 1) {
+  
+  gostplot(goResults, 
+           capped = TRUE,   # indicator whether the -log10(p-values) would be capped at 16 if bigger than 16
+           interactive = TRUE)
+  
+  gostplot(goResults, 
+           capped = TRUE,   # indicator whether the -log10(p-values) would be capped at 16 if bigger than 16
+           interactive = FALSE)  -> gostplot1
+}
+```
+
+```{r publish-gostplot}
+if (nrow(DE) >= 1) {
+  pp <- publish_gostplot(gostplot1, 
+                         #highlight_terms = c("CORUM:746", "GO:0071695"), # choose from "goResults$result$term_id"
+                         width = NA, height = NA, filename = NULL )
+  #pp
+}
+```
+
+---
+### Gost-table
+
+```{r}
+if (nrow(DE) > 1) {
+  publish_gosttable(goResults, 
+                    #highlight_terms = gostres$result[c(1:2,10,120),],
+                    use_colors = TRUE, 
+                    show_columns = c("source", "term_name", "term_size", "intersection_size"),
+                   filename = NULL)
+}
+```
+
+
+## Gene Set Enrichtment Analysis (GSEA)
+
+https://compgenomr.github.io/book/gene-expression-analysis-using-high-throughput-sequencing-technologies.html#functional-enrichment-analysis 8.3.8
+A gene set is a collection of genes with some common property. This shared property among a set of genes could be a GO term, a common biological pathway, a shared interaction partner, or any biologically relevant commonality that is meaningful in the context of the pursued experiment. Gene set enrichment analysis (GSEA) is a valuable exploratory analysis tool that can associate systematic changes to a high-level function rather than individual genes.
+---
+

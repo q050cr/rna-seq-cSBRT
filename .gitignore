@@ -1,0 +1,16 @@
+## https://linuxize.com/post/gitignore-ignoring-files-in-git/
+# files anywhere
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+# folders
+bam/
+fastqc_dir/
+metadata/
+rawcounts/
+reports-deseq/
+results/
+scripts/old/
+._rna-seq-cSBRT.Rproj
