@@ -14,7 +14,7 @@ params:
   strat_groups: "radiation2groups"
   continous: FALSE
   LV_only: TRUE
-  pval_threshold: 0.05  # default in DESeq2
+  pval_threshold: 0.05  # default in DESeq2 0.1
 output: 
   html_document:
     theme: paper

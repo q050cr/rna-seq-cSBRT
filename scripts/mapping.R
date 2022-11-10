@@ -30,7 +30,7 @@ fastq1 <- list.files(path = file.path(fastqDir), pattern = "*1.fastq.gz$", full.
 fastq2 <- list.files(path = file.path(fastqDir), pattern = "*2.fastq.gz$", full.names = TRUE)
 all.equal(length(fastq1),length(fastq2))
 
-fastqc_dir <- "rna-seq-rahm/fastqc_dir/"
+fastqc_dir <- "rna-seq-cSBRT/fastqc_dir/"
 fastqcr::fastqc(fq.dir = fastqDir,  # FASTQ files directory
                 qc.dir = fastqc_dir,  # Results directory
                 threads = 4  # default
@@ -118,7 +118,7 @@ time2 <- Sys.time()
 difftime <- time2-time1  # Time difference of 5.580616 hours
 
 # We can get an overview of BAM file information using the quickBamFlagSummary() function. Count the number of unaligned reads. How many unique read IDs (QNAMEs) are there?
-Rsamtools::quickBamFlagSummary("rna-seq-rahm/bam/SID16733.R1.fastq.gz.bam")
+Rsamtools::quickBamFlagSummary("rna-seq-cSBRT/bam/SID16733.R1.fastq.gz.bam")
 # We can now review our BAM file in IGV.
 
 #####
@@ -126,7 +126,7 @@ Rsamtools::quickBamFlagSummary("rna-seq-rahm/bam/SID16733.R1.fastq.gz.bam")
 # Now that we’ve aligned our reads, we can use FeatureCounts to count the reads to genes from the genomic alignment. We can use the inbuilt annotation.
 
 # count features 
-bamFiles <-list.files(path = "rna-seq-rahm/bam", pattern = ".bam$", full.names = TRUE)  # needs to be done since bam files do not include "^.R2.fastq.gz.bam" files
+bamFiles <-list.files(path = "rna-seq-cSBRT/bam", pattern = ".bam$", full.names = TRUE)  # needs to be done since bam files do not include "^.R2.fastq.gz.bam" files
 
 countsHg38Paired <- Rsubread::featureCounts(files=bamFiles,
                                           annot.inbuilt="hg38",
@@ -138,8 +138,8 @@ countsHg38Paired <- Rsubread::featureCounts(files=bamFiles,
                                           requireBothEndsMapped=T,
                                           nthreads=6)
 
-save(countsHg38Paired, file="rna-seq-rahm/rawcounts/rawCounts.rda")
-saveRDS(countsHg38Paired, file="rna-seq-rahm/rawcounts/rawCounts.rds")
+save(countsHg38Paired, file="rna-seq-cSBRT/rawcounts/rawCounts.rda")
+saveRDS(countsHg38Paired, file="rna-seq-cSBRT/rawcounts/rawCounts.rds")
 # lets take a look at the stats of our counts
 
 countsHg38Paired$stat

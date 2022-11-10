@@ -5,11 +5,19 @@
 .RData
 .Ruserdata
 .DS_Store
+
+# random files
+my_index.*
+
 # folders
 bam/
+bam_align/
+db/
 fastqc_dir/
 metadata/
+packrat/
 rawcounts/
+references/
 reports-deseq/
 results/
 scripts/old/
